@@ -1,0 +1,257 @@
+#!/usr/bin/env python
+
+import json
+import optparse
+import os
+import subprocess
+import sys
+
+
+def gitdir():
+    """Return the path to the current git repo's .git directory."""
+    proc = subprocess.Popen(["git", "rev-parse", "--git-dir"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate()
+
+    if proc.returncode:
+        raise RuntimeError("rev-parse --git-dir returned nonzero (%d):\n%s" % (proc.returncode, stderr))
+
+    return stdout.strip()
+
+
+def revparse(rev):
+    """Resolves a shaish into a sha via git-rev-parse."""
+    if not rev:
+        raise ValueError("revparse() needs a valid shaish to parse.")
+
+    proc = subprocess.Popen(["git", "rev-parse", "--verify", "--quiet", rev],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate()
+
+    if proc.returncode:
+        raise RuntimeError("rev-parse %s returned nonzero (%d):\n%s" % (rev, proc.returncode, stderr))
+
+    return stdout.strip()
+
+
+def namerev(rev):
+    """Resolves a shaish into a name via git-name-rev."""
+    if not rev:
+        raise ValueError("namerev() needs a valid shaish to parse.")
+
+    proc = subprocess.Popen(["git", "name-rev", "--name-only", rev],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate()
+
+    if proc.returncode:
+        raise RuntimeError("name-rev %s returned nonzero (%d):\n%s" % (rev, proc.returncode, stderr))
+
+    return stdout.strip()
+
+
+def revlist(start, end, *args):
+    """Returns a list of revisions in start..end (as git-rev-list yields).
+
+    Any extra arguments are passed to the git subprocess as arguments."""
+    if not start:
+        raise ValueError("revlist() needs a valid start shaish.")
+
+    if not end:
+        end = 'HEAD'
+
+    proc = subprocess.Popen(["git", "rev-list"] + list(args) + ["%s..%s" % (start,end)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate()
+
+    if proc.returncode:
+        raise RuntimeError("rev-list returned nonzero (%d):\n%s" % (proc.returncode, stderr))
+
+    return stdout.strip().split("\n")
+
+
+def checkout(rev, *args):
+    """Check out a specified shaish in the current git repository.
+
+    Any extra arguments are passed to the git subprocess as arguments."""
+    if not rev:
+        raise ValueError("checkout() needs a valid shaish to check out.")
+
+    proc = subprocess.Popen(["git", "checkout"] + list(args) + [rev],
+        stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate()
+
+    if proc.returncode:
+        raise RuntimeError("rev-list returned nonzero (%d):\n%s" % (proc.returncode, stderr))
+
+
+def write_shalist(git_dir, revisions):
+    """Write a list of SHAs to the appropriate file."""
+
+    shalist_path = os.path.join(git_dir, 'BISECT_MERGES_SHALIST')
+    shalist_file = open(shalist_path, 'w')
+    shalist_file.writelines("%s\n" % r for r in revisions)
+    shalist_file.close()
+
+
+def read_shalist(git_dir):
+    """Read in a list of SHAs from the appropriate file."""
+
+    shalist_path = os.path.join(git_dir, 'BISECT_MERGES_SHALIST')
+
+    if not os.path.exists(shalist_path):
+        print >> sys.stderr, "There does not seem to be a bisection in progress."
+        sys.exit(1)
+
+    shalist_file = open(shalist_path)
+    revisions = [line.strip() for line in shalist_file]
+    shalist_file.close()
+    return revisions
+
+
+def write_metadata(git_dir, metadata):
+    """Write metadata out to the appropriate file."""
+
+    metadata_path = os.path.join(git_dir, 'BISECT_MERGES_INFO')
+    metadata_file = open(metadata_path, 'w')
+    json.dump(metadata, metadata_file)
+    metadata_file.close()
+
+
+def read_metadata(git_dir):
+    """Read metadata out of the appropriate file."""
+
+    metadata_path = os.path.join(git_dir, 'BISECT_MERGES_INFO')
+
+    if not os.path.exists(metadata_path):
+        print >> sys.stderr, "There does not seem to be a bisection in progress."
+        sys.exit(1)
+
+    metadata_file = open(metadata_path)
+    metadata = json.load(metadata_file)
+    metadata_file.close()
+    return metadata
+
+
+def bisect_start(opts, args):
+    """Starts a bisection.
+
+    1. Verify that both start and end are valid shaish's.
+    2. Grab the list of revisions in between them.
+    3. Write out the list to .git/BISECT_MERGES_SHALIST
+    4. Write out other metadata to .git/BISECT_MERGES_INFO
+    5. Check out the middle revision.
+    """
+
+    git_dir = gitdir()
+    metadata_path = os.path.join(git_dir, 'BISECT_MERGES_INFO')
+    shalist_path = os.path.join(git_dir, 'BISECT_MERGES_SHALIST')
+    if os.path.exists(shalist_path) or os.path.exists(metadata_path):
+        print >> sys.stderr, "Aborting 'start': There appears to already be a bisection in process."
+        sys.exit(1)
+
+    current_branch = namerev('HEAD')
+
+    start = revparse(args[1])
+    if len(args) > 2:
+        end = revparse(args[2])
+    else:
+        end = revparse('HEAD')
+
+    revisions = revlist(start, end, '--first-parent')
+
+    print "Bisecting %d revisions." % len(revisions)
+
+    write_shalist(git_dir, revisions)
+    write_metadata(git_dir, {'previous_checkout': current_branch})
+
+    checkout(revisions[len(revisions) // 2])
+
+    if not opts.quiet:
+        print "Checked out first candidate. Use '%s good' or '%s bad' to mark appropriately after testing." % (sys.argv[0], sys.argv[0])
+        print "(You can also use '%s abort' to stop bisecting and return to where you where before.)" % sys.argv[0]
+
+
+def bisect_abort(opts, args):
+    """Abort the current bisection and go back to where we were before."""
+
+    git_dir = gitdir()
+    metadata = read_metadata(git_dir)
+
+    metadata_path = os.path.join(git_dir, 'BISECT_MERGES_INFO')
+    shalist_path = os.path.join(git_dir, 'BISECT_MERGES_SHALIST')
+    if os.path.exists(shalist_path):
+        os.unlink(shalist_path)
+    os.unlink(metadata_path)
+
+    print "Aborting bisection, checking out previous (%s) ..." % metadata['previous_checkout']
+
+    checkout(metadata['previous_checkout'])
+
+
+def bisect_mark(opts, args):
+    """Mark the current revision as either good or bad and continue the bisection."""
+
+    git_dir = gitdir()
+    revisions = read_shalist(git_dir)
+
+    head = revparse('HEAD')
+    index = revisions.index(head)
+    if args[0] == 'good':
+        # Good revision means we want to pare off this rev and everything before it
+        # in time (after it in the list)
+        revisions = revisions[:index]
+    else:
+        # Bad revision means we want to pare off everything after this rev in time
+        # (before it in the list)
+        revisions = revisions[index:]
+
+    if len(revisions) > 1:
+        print "%d revisions left to bisect." % len(revisions)
+
+        write_shalist(git_dir, revisions)
+        checkout(revisions[len(revisions) // 2])
+
+        if not opts.quiet:
+            print "Checked next first candidate. Use '%s good' or '%s bad' to mark appropriately after testing." % (sys.argv[0], sys.argv[0])
+            print "(You can also use '%s abort' to stop bisecting and return to where you where before.)" % sys.argv[0]
+    else:
+        earliest_bad = revisions[0]
+        if head != earliest_bad:
+            checkout(earliest_bad)
+        print "Done bisecting. Earliest bad revision (%s) has been checked out." % earliest_bad[:7]
+
+        shalist_path = os.path.join(git_dir, 'BISECT_MERGES_SHALIST')
+        if os.path.exists(shalist_path):
+            os.unlink(shalist_path)
+
+        metadata_path = os.path.join(git_dir, 'BISECT_MERGES_INFO')
+        if os.path.exists(metadata_path):
+            os.unlink(metadata_path)
+
+def main():
+    usage = "Usage: %prog [options] [start <known-good> [<known-bad>] | good | bad | abort]"
+    parser = optparse.OptionParser(usage)
+
+    parser.add_option("-q", "--quiet", dest="quiet", default=False, action="store_true",
+        help="Provide fewer instructions and/or detail.")
+
+    options, arguments = parser.parse_args()
+
+    if not arguments:
+        parser.error("You must specify one of: start, good, bad, abort.")
+
+    if arguments[0] == "start":
+        if len(arguments) < 2:
+            parser.error("Action 'start' must be followed by a known-good shaish.")
+        bisect_start(options, arguments)
+    elif arguments[0] in ("good", "bad"):
+        bisect_mark(options, arguments)
+    elif arguments[0] == "abort":
+        bisect_abort(options, arguments)
+    else:
+        parser.error("Unrecognized action '%s' - must be one of: start, good, bad, abort)." % arguments[0])
+
+if __name__ == "__main__":
+    main()
+
+# vim: set ts=4 sts=4 et sw=4:
